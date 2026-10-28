@@ -1,0 +1,10 @@
+{
+  "name": "CloudCore",
+  "private": true,
+  "scripts": {
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "dev:server": "pnpm --filter server dev",
+    "dev:client": "pnpm --filter client dev"
+  }
+}
