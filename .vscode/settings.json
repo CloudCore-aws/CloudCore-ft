@@ -1,0 +1,5 @@
+{
+  // The project uses Prisma 6 (url = env(...) in schema.prisma); without this the
+  // Prisma extension validates against Prisma 7 rules and flags the datasource url
+  "prisma.pinToPrisma6": true
+}
