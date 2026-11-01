@@ -3,3 +3,6 @@ dist
 .env
 uploads
 .DS_Store
+# test downloads
+downloaded.*
+*.out

@@ -15,7 +15,12 @@ const findActive = (shareToken: string) =>
       downloadsRemaining: { gt: 0 },
     },
   });
-
+// Creates a one-time download ticket valid for 60 seconds
+async function issueTicket(fileId: string) {
+  const ticket = newToken(24);
+  await redis.set(`ticket:${ticket}`, fileId, 'EX', 60);
+  return ticket;
+} 
 export async function vaultRoutes(app: FastifyInstance) {
   // 1. STATUS — only says whether a password is needed. No name, no size.
   app.get('/vault/:token/status', async (req, reply) => {
@@ -52,20 +57,51 @@ export async function vaultRoutes(app: FastifyInstance) {
         if (!ok) return reply.code(401).send({ error: 'Wrong passkey' });
       }
 
-      // One-time download ticket, valid 60 seconds
-      const ticket = newToken(24);
-      await redis.set(`ticket:${ticket}`, file.id, 'EX', 60);
+      // Unlock session: lets the page get fresh tickets for 15 min without the passkey
+      const unlockSession = newToken(24);
+      await redis.set(`session:${unlockSession}`, file.id, 'EX', 15 * 60);
 
       return {
         fileName: file.originalName,
         sizeBytes: file.sizeBytes,
         expiresAt: file.expiresAt,
         downloadsRemaining: file.downloadsRemaining,
-        downloadTicket: ticket,
+        downloadTicket: await issueTicket(file.id),
+        unlockSession,
       };
     }
   );
+  // 2b. TICKET — fresh download ticket using the unlock session (no passkey needed)
+  app.post(
+    '/vault/:token/ticket',
+    {
+      config: {
+        rateLimit: {
+          max: 30,
+          timeWindow: '15 minutes',
+          keyGenerator: (req) => `ticket:${req.ip}:${(req.params as any).token}`,
+        },
+      },
+    },
+    async (req, reply) => {
+      const { token } = req.params as { token: string };
+      const { unlockSession } = (req.body ?? {}) as { unlockSession?: string };
+      if (!unlockSession) return reply.code(400).send({ error: 'Missing unlock session' });
 
+      const sessionFileId = await redis.get(`session:${unlockSession}`);
+      const file = await findActive(token);
+
+      // Session must exist AND belong to this exact link
+      if (!sessionFileId || !file || file.id !== sessionFileId) {
+        return reply.code(403).send({ error: 'Session expired, please unlock again' });
+      }
+
+      return {
+        downloadTicket: await issueTicket(file.id),
+        downloadsRemaining: file.downloadsRemaining,
+      };
+    }
+  );
   // 3. DOWNLOAD — single-use ticket + atomic decrement
   app.get('/vault/:token/download', async (req, reply) => {
     const { ticket } = req.query as { ticket?: string };
@@ -95,6 +131,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     reply
       .header('Content-Type', file.mimeType)
       .header('Content-Length', file.sizeBytes)
+      .header('X-Content-Type-Options', 'nosniff')
       .header(
         'Content-Disposition',
         `attachment; filename*=UTF-8''${encodeURIComponent(file.originalName)}`
