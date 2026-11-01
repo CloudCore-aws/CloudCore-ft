@@ -1,125 +1,104 @@
-import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyInstance } from 'fastify';
 import argon2 from 'argon2';
 import { prisma } from '../lib/prisma.js';
 import { redis } from '../lib/redis.js';
 import { storage } from '../storage/index.js';
 import { newToken } from '../lib/tokens.js';
 
-const TICKET_TTL_S = 60;
-
-type TokenParams = { Params: { token: string } };
-
-// Look up a vault by share token. Missing and already-deleted vaults get the same 404
-// so the response never says "this existed once".
-async function findVault(token: string, reply: FastifyReply) {
-  const file = await prisma.file.findUnique({ where: { shareToken: token } });
-  if (!file || file.deletedAt) {
-    reply.code(404).send({ error: 'Vault not found' });
-    return null;
-  }
-  if (file.expiresAt <= new Date() || file.downloadsRemaining <= 0) {
-    reply.code(410).send({ error: 'Vault has expired or reached its download limit' });
-    return null;
-  }
-  return file;
-}
-
-// Keep the original name for the browser, but strip anything that could break the header
-function contentDisposition(name: string) {
-  const ascii = name.replace(/[^\x20-\x7e]|["\\]/g, '_');
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
-}
-
-export async function vaultRoutes(app: FastifyInstance) {
-  // Only tells the client whether to show a passkey box: no name, size or type
-  // until the vault is unlocked
-  app.get<TokenParams>('/vault/:token/status', async (req, reply) => {
-    const file = await findVault(req.params.token, reply);
-    if (!file) return;
-    return { requiresPassword: file.passkeyHash !== null };
+// A file is usable only if: not deleted, not expired, downloads remain
+const findActive = (shareToken: string) =>
+  prisma.file.findFirst({
+    where: {
+      shareToken,
+      deletedAt: null,
+      expiresAt: { gt: new Date() },
+      downloadsRemaining: { gt: 0 },
+    },
   });
 
-  app.post<TokenParams & { Body: { passkey?: unknown } | undefined }>(
+export async function vaultRoutes(app: FastifyInstance) {
+  // 1. STATUS — only says whether a password is needed. No name, no size.
+  app.get('/vault/:token/status', async (req, reply) => {
+    const { token } = req.params as { token: string };
+    const file = await findActive(token);
+    if (!file) return reply.code(404).send({ error: 'Link expired or invalid' });
+    return { requiresPassword: !!file.passkeyHash };
+  });
+
+  // 2. UNLOCK — max 5 attempts per IP per link every 15 minutes
+  app.post(
     '/vault/:token/unlock',
     {
       config: {
-        // Brute-force guard: 5 attempts per IP per vault every 15 minutes, counted in
-        // Redis so the limit survives restarts and is shared between server instances
         rateLimit: {
           max: 5,
           timeWindow: '15 minutes',
-          keyGenerator: (req: FastifyRequest) =>
-            `unlock:${req.ip}:${(req.params as { token: string }).token}`,
+          keyGenerator: (req) => `${req.ip}:${(req.params as any).token}`,
         },
       },
     },
     async (req, reply) => {
-      const file = await findVault(req.params.token, reply);
-      if (!file) return;
+      const { token } = req.params as { token: string };
+      const { passkey } = (req.body ?? {}) as { passkey?: string };
+
+      const file = await findActive(token);
+      if (!file) return reply.code(404).send({ error: 'Link expired or invalid' });
 
       if (file.passkeyHash) {
-        const passkey = req.body?.passkey;
-        const ok = typeof passkey === 'string' && (await argon2.verify(file.passkeyHash, passkey));
-        if (!ok) {
-          await prisma.accessLog.create({ data: { fileId: file.id, ip: req.ip, action: 'UNLOCK_FAIL' } });
-          return reply.code(401).send({ error: 'Wrong passkey' });
-        }
+        const ok = !!passkey && (await argon2.verify(file.passkeyHash, passkey));
+        await prisma.accessLog.create({
+          data: { fileId: file.id, ip: req.ip, action: ok ? 'UNLOCK_OK' : 'UNLOCK_FAIL' },
+        });
+        if (!ok) return reply.code(401).send({ error: 'Wrong passkey' });
       }
-      await prisma.accessLog.create({ data: { fileId: file.id, ip: req.ip, action: 'UNLOCK_OK' } });
 
-      // Short-lived, single-use ticket: the download link never carries the passkey,
-      // and a leaked link is useless after one use or 60 seconds
-      const ticket = newToken();
-      await redis.set(`ticket:${ticket}`, file.id, 'EX', TICKET_TTL_S);
+      // One-time download ticket, valid 60 seconds
+      const ticket = newToken(24);
+      await redis.set(`ticket:${ticket}`, file.id, 'EX', 60);
 
       return {
-        originalName: file.originalName,
+        fileName: file.originalName,
         sizeBytes: file.sizeBytes,
-        mimeType: file.mimeType,
         expiresAt: file.expiresAt,
         downloadsRemaining: file.downloadsRemaining,
-        ticket,
+        downloadTicket: ticket,
       };
-    },
+    }
   );
 
-  app.get<TokenParams & { Querystring: { ticket?: string } }>(
-    '/vault/:token/download',
-    async (req, reply) => {
-      const { ticket } = req.query;
-      // GETDEL reads and deletes in one step, so two requests can never both use a ticket
-      const fileId = typeof ticket === 'string' ? await redis.getdel(`ticket:${ticket}`) : null;
-      if (!fileId) return reply.code(403).send({ error: 'Invalid or expired ticket' });
+  // 3. DOWNLOAD — single-use ticket + atomic decrement
+  app.get('/vault/:token/download', async (req, reply) => {
+    const { ticket } = req.query as { ticket?: string };
+    if (!ticket) return reply.code(400).send({ error: 'Missing ticket' });
 
-      const file = await findVault(req.params.token, reply);
-      if (!file) return;
-      if (file.id !== fileId) return reply.code(403).send({ error: 'Invalid or expired ticket' });
+    // GETDEL reads and deletes in one step → a ticket works only once
+    const fileId = await redis.getdel(`ticket:${ticket}`);
+    if (!fileId) return reply.code(403).send({ error: 'Ticket invalid or expired' });
 
-      // Atomic check-and-decrement in a single UPDATE ... WHERE downloadsRemaining > 0.
-      // Reading the count and then writing it would let parallel requests both pass the check.
-      const { count } = await prisma.file.updateMany({
-        where: {
-          id: file.id,
-          deletedAt: null,
-          expiresAt: { gt: new Date() },
-          downloadsRemaining: { gt: 0 },
-        },
-        data: { downloadsRemaining: { decrement: 1 } },
-      });
-      if (count === 0) {
-        return reply.code(410).send({ error: 'Vault has expired or reached its download limit' });
-      }
-      await prisma.accessLog.create({ data: { fileId: file.id, ip: req.ip, action: 'DOWNLOAD' } });
+    // THE RACE-CONDITION FIX: check and decrement in ONE statement
+    const { count } = await prisma.file.updateMany({
+      where: {
+        id: fileId,
+        downloadsRemaining: { gt: 0 },
+        expiresAt: { gt: new Date() },
+        deletedAt: null,
+      },
+      data: { downloadsRemaining: { decrement: 1 } },
+    });
+    if (count === 0) {
+      return reply.code(410).send({ error: 'Download limit reached or link expired' });
+    }
 
-      return reply
-        .header('Content-Type', file.mimeType)
-        .header('Content-Length', file.sizeBytes)
-        // attachment + nosniff: the browser saves the file instead of rendering it, so an
-        // uploaded .html file can't run scripts on our origin
-        .header('Content-Disposition', contentDisposition(file.originalName))
-        .header('X-Content-Type-Options', 'nosniff')
-        .header('Cache-Control', 'no-store')
-        .send(storage.get(file.storageKey));
-    },
-  );
+    const file = await prisma.file.findUniqueOrThrow({ where: { id: fileId } });
+    await prisma.accessLog.create({ data: { fileId, ip: req.ip, action: 'DOWNLOAD' } });
+
+    reply
+      .header('Content-Type', file.mimeType)
+      .header('Content-Length', file.sizeBytes)
+      .header(
+        'Content-Disposition',
+        `attachment; filename*=UTF-8''${encodeURIComponent(file.originalName)}`
+      );
+    return reply.send(storage.get(file.storageKey)); // teammate's method name
+  });
 }
