@@ -29,7 +29,12 @@ export async function fileRoutes(app: FastifyInstance) {
     }
 
     const storageKey = randomUUID();
-    await storage.put(storageKey, part.file);
+    try {
+      await storage.put(storageKey, part.file);
+    } catch (err) {
+      await storage.delete(storageKey); // don't leave a partial file behind
+      throw err;                        // Fastify turns the size-limit error into HTTP 413
+    }
 
     if (part.file.truncated) {
       await storage.delete(storageKey);
