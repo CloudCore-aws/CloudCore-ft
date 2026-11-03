@@ -64,7 +64,7 @@ export default function UploadPage() {
       return data;
     },
     onSuccess: (data) => navigate('/share', { state: { ...data, hasPasskey: !!passkey } }),
-    onError: (e: any) => setError(e?.response ? errorMessage(e) : e.message),
+    onError: (e) => setError(errorMessage(e)),
   });
 
   return (

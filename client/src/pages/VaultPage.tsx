@@ -3,13 +3,13 @@ import { useParams } from 'react-router-dom';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { Download, Lock, ShieldX, Clock, FileText } from 'lucide-react';
 import {
-  api, API_BASE, errorMessage, formatBytes,
+  api, API_BASE, errorMessage, errorStatus, formatBytes,
   type UnlockResponse, type TicketResponse,
 } from '../api';
 
 // Live countdown to the expiry time, updated every second
 function useCountdown(target?: string) {
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
@@ -49,8 +49,8 @@ export default function VaultPage() {
       setPasskey('');   // don't keep the passkey in memory
       setError('');
     },
-    onError: (e: any) => {
-      const code = e?.response?.status;
+    onError: (e) => {
+      const code = errorStatus(e);
       if (code === 429) setError('Too many attempts. Try again in 15 minutes.');
       else if (code === 404) setError('This link has expired or been destroyed.');
       else setError(errorMessage(e));
@@ -58,12 +58,14 @@ export default function VaultPage() {
   });
 
   // No passkey needed → unlock automatically, once
+  // No passkey needed → unlock automatically, once
+  const runUnlock = unlock.mutate; // stable function from TanStack Query
   useEffect(() => {
     if (status.data && !status.data.requiresPassword && !autoUnlocked.current) {
       autoUnlocked.current = true;
-      unlock.mutate(undefined);
+      runUnlock(undefined);
     }
-  }, [status.data]);
+  }, [status.data, runUnlock]);
 
   // Step 3: get a fresh ticket via the unlock session, then download
   const download = useMutation({
@@ -81,8 +83,8 @@ export default function VaultPage() {
           : 'Download started. That was the last one, so the file will now self-destruct.'
       );
     },
-    onError: (e: any) => {
-      if (e?.response?.status === 403) {
+    onError: (e) => {
+      if (errorStatus(e) === 403) {
         // Session expired (or file used up): go back to unlocking
         setInfo(null);
         if (status.data?.requiresPassword) setError('Session expired. Please enter the passkey again.');
