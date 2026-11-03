@@ -1,4 +1,20 @@
 services:
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://vault:vault@postgres:5432/vaultdrop
+      REDIS_URL: redis://redis:6379
+      CLIENT_ORIGIN: http://localhost:5173
+      STORAGE_DIR: /data/uploads
+    ports:
+      - "4000:4000"
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      - postgres
+      - redis
   postgres:
     image: postgres:16
     environment:
@@ -15,3 +31,4 @@ services:
       - "6379:6379"
 volumes:
   pgdata:
+  uploads:
