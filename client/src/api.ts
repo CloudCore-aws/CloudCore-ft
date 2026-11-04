@@ -3,7 +3,12 @@ import axios from 'axios';
 export const API_BASE = import.meta.env.VITE_API_URL ?? '/api';
 export const api = axios.create({ baseURL: API_BASE });
 
+// true only in production builds (client/.env.production)
+export const DIRECT_UPLOAD = import.meta.env.VITE_DIRECT_UPLOAD === 'true';
+
 export type UploadResponse = { shareToken: string; expiresAt: string };
+
+export type InitResponse = { fileId: string; uploadUrl: string };
 
 export type UnlockResponse = {
   fileName: string;

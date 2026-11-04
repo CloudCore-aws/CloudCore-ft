@@ -19,6 +19,7 @@ model File {
   downloadsRemaining Int
   expiresAt          DateTime
   deletedAt          DateTime?
+  uploadedAt         DateTime?
   createdAt          DateTime    @default(now())
   accessLogs         AccessLog[]
 

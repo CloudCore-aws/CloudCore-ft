@@ -4,7 +4,11 @@ import { useMutation } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { UploadCloud, Lock, X } from 'lucide-react';
 import { zipSync } from 'fflate';
-import { api, errorMessage, formatBytes, type UploadResponse } from '../api';
+import axios from 'axios';
+import {
+  api, DIRECT_UPLOAD, errorMessage, formatBytes,
+  type InitResponse, type UploadResponse,
+} from '../api';
 
 const MAX_BYTES = 100 * 1024 * 1024;
 const BLOCKED = ['.exe', '.bat', '.cmd', '.msi', '.scr', '.ps1']; // UX check only
@@ -47,11 +51,44 @@ export default function UploadPage() {
 
   const removeFile = (index: number) => setFiles(files.filter((_, i) => i !== index));
 
+  const onProgress = (e: { loaded: number; total?: number }) =>
+    setProgress(Math.round((e.loaded * 100) / (e.total ?? 1)));
+
   const upload = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (): Promise<UploadResponse> => {
       const file = await bundle(files);
       if (file.size > MAX_BYTES) throw new Error('Total size must be 100MB or less');
 
+      // ── AWS MODE: browser → S3 directly (production build) ──
+      if (DIRECT_UPLOAD) {
+        const mimeType = file.type || 'application/octet-stream';
+
+        // 1. Ask the server for a pre-signed S3 upload URL
+        const { data: init } = await api.post<InitResponse>('/files/init', {
+          fileName: file.name,
+          mimeType,
+          sizeBytes: file.size,
+          expiry,
+          maxDownloads: cap,
+          passkey: passkey || undefined,
+        });
+
+        // 2. Upload straight to S3 (Content-Type must match what was signed)
+        try {
+          await axios.put(init.uploadUrl, file, {
+            headers: { 'Content-Type': mimeType },
+            onUploadProgress: onProgress,
+          });
+        } catch {
+          throw new Error('Upload to storage failed. Please try again.');
+        }
+
+        // 3. Tell the server it's done → get the share token
+        const { data } = await api.post<UploadResponse>(`/files/${init.fileId}/complete`);
+        return data;
+      }
+
+      // ── LOCAL MODE: browser → server (pnpm dev) ──
       const form = new FormData();
       form.append('expiry', expiry);            // fields FIRST (backend requirement)
       form.append('maxDownloads', String(cap));
@@ -59,7 +96,7 @@ export default function UploadPage() {
       form.append('file', file);                // file LAST
 
       const { data } = await api.post<UploadResponse>('/files', form, {
-        onUploadProgress: (e) => setProgress(Math.round((e.loaded * 100) / (e.total ?? 1))),
+        onUploadProgress: onProgress,
       });
       return data;
     },

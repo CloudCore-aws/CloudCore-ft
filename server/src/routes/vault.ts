@@ -4,8 +4,9 @@ import { prisma } from '../lib/prisma.js';
 import { redis } from '../lib/redis.js';
 import { storage } from '../storage/index.js';
 import { newToken } from '../lib/tokens.js';
+import { presignGet } from '../storage/s3.js'; // NEW (AWS download links)
 
-// A file is usable only if: not deleted, not expired, downloads remain
+// A file is usable only if: upload confirmed, not deleted, not expired, downloads remain
 const findActive = (shareToken: string) =>
   prisma.file.findFirst({
     where: {
@@ -13,16 +14,21 @@ const findActive = (shareToken: string) =>
       deletedAt: null,
       expiresAt: { gt: new Date() },
       downloadsRemaining: { gt: 0 },
+      uploadedAt: { not: null }, // NEW: hide uploads that never finished
     },
   });
+
 // Creates a one-time download ticket valid for 60 seconds
 async function issueTicket(fileId: string) {
   const ticket = newToken(24);
   await redis.set(`ticket:${ticket}`, fileId, 'EX', 60);
   return ticket;
-} 
+}
+
 export async function vaultRoutes(app: FastifyInstance) {
-  // 1. STATUS — only says whether a password is needed. No name, no size.
+  // ─────────────────────────────────────────────────────────────
+  // 1. STATUS: only says whether a passkey is needed. No name, no size.
+  // ─────────────────────────────────────────────────────────────
   app.get('/vault/:token/status', async (req, reply) => {
     const { token } = req.params as { token: string };
     const file = await findActive(token);
@@ -30,7 +36,9 @@ export async function vaultRoutes(app: FastifyInstance) {
     return { requiresPassword: !!file.passkeyHash };
   });
 
-  // 2. UNLOCK — max 5 attempts per IP per link every 15 minutes
+  // ─────────────────────────────────────────────────────────────
+  // 2. UNLOCK: max 5 attempts per IP per link every 15 minutes
+  // ─────────────────────────────────────────────────────────────
   app.post(
     '/vault/:token/unlock',
     {
@@ -71,7 +79,10 @@ export async function vaultRoutes(app: FastifyInstance) {
       };
     }
   );
-  // 2b. TICKET — fresh download ticket using the unlock session (no passkey needed)
+
+  // ─────────────────────────────────────────────────────────────
+  // 2b. TICKET: fresh download ticket from the unlock session
+  // ─────────────────────────────────────────────────────────────
   app.post(
     '/vault/:token/ticket',
     {
@@ -102,7 +113,10 @@ export async function vaultRoutes(app: FastifyInstance) {
       };
     }
   );
-  // 3. DOWNLOAD — single-use ticket + atomic decrement
+
+  // ─────────────────────────────────────────────────────────────
+  // 3. DOWNLOAD: single-use ticket + atomic decrement
+  // ─────────────────────────────────────────────────────────────
   app.get('/vault/:token/download', async (req, reply) => {
     const { ticket } = req.query as { ticket?: string };
     if (!ticket) return reply.code(400).send({ error: 'Missing ticket' });
@@ -128,6 +142,12 @@ export async function vaultRoutes(app: FastifyInstance) {
     const file = await prisma.file.findUniqueOrThrow({ where: { id: fileId } });
     await prisma.accessLog.create({ data: { fileId, ip: req.ip, action: 'DOWNLOAD' } });
 
+    // NEW: AWS mode sends the browser straight to S3 with a 60-second link
+    if (process.env.STORAGE_DRIVER === 's3') {
+      return reply.redirect(await presignGet(file.storageKey, file.originalName));
+    }
+
+    // Local mode: stream the file from disk through the server
     reply
       .header('Content-Type', file.mimeType)
       .header('Content-Length', file.sizeBytes)

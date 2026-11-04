@@ -8,7 +8,8 @@ import { fileRoutes } from './routes/files.js';
 import { vaultRoutes } from './routes/vault.js';
 import { startCleanupWorker } from './workers/cleanup.js';
 
-const app = Fastify({ logger: true, trustProxy: true });
+// trustProxy: 1 → trust ONLY the address added by the one proxy in front (CloudFront)
+const app = Fastify({ logger: true, trustProxy: 1 });
 
 await app.register(cors, { origin: process.env.CLIENT_ORIGIN });
 await app.register(multipart, {
@@ -20,6 +21,6 @@ await app.register(fileRoutes, { prefix: '/api' });
 await app.register(vaultRoutes, { prefix: '/api' });
 
 app.get('/health', async () => ({ ok: true }));
-startCleanupWorker(); // Start the cleanup worker
 
+startCleanupWorker();
 await app.listen({ port: Number(process.env.PORT ?? 4000), host: '0.0.0.0' });
